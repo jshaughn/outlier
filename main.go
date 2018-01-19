@@ -13,54 +13,15 @@ import (
 	"github.com/prometheus/client_golang/api"
 	"github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
+
+	"github.com/jshaughn/outlier/nelson"
 )
 
 type options struct {
-	server       string
-	sampleMin    int
-	samplePeriod time.Duration
-	sampleOffset time.Duration
-	interval     time.Duration
-}
-
-func main() {
-	options := parseFlags()
-	checkError(validateOptions(options))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	config := api.Config{options.server, nil}
-	client, err := api.NewClient(config)
-	checkError(err)
-
-	api := v1.NewAPI(client)
-	value, err := api.Query(ctx, "http_requests_total [1m]", time.Now())
-	checkError(err)
-
-	switch t := value.Type(); t {
-	case model.ValVector: // Instant Vector
-		fmt.Printf("Handle Instant Vector\n")
-		vector := value.(model.Vector)
-		for _, sample := range vector {
-			fmt.Printf("sample: %v\n", sample)
-		}
-	case model.ValMatrix: // Range Vector
-		fmt.Printf("Handle Range Vector\n")
-		matrix := value.(model.Matrix)
-		for _, sample := range matrix {
-			fmt.Printf("sample: %v\n", sample)
-		}
-	default:
-		fmt.Printf("I don't know about type %v!\n", t)
-	}
-}
-
-func checkError(err error) {
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
-	}
+	server     string
+	sampleSize int
+	offset     time.Duration
+	interval   time.Duration
 }
 
 func parseFlags() options {
@@ -69,19 +30,17 @@ func parseFlags() options {
 		serverDefault = "http://localhost:9090"
 	}
 	server := flag.String("server", serverDefault, "Prometheus server URL (can be set via PROMETHEUS_SERVER environment variable)")
-	sampleMin := flag.String("sampleMin", "50", "Minimum number of data points used to calculate mean, standard deviation, etc.")
-	samplePeriod := flag.String("samplePeriod", "24h", "Period of data used to calculate mean, standard deviation, etc.")
-	sampleOffset := flag.String("sampleOffset", "0h", "Offset from now used as endpoint for sample query.")
-	interval := flag.String("interval", "15s", "Query interval.")
+	sampleSize := flag.String("sampleSize", "50", "Number of data points used to calculate mean, standard deviation, etc.")
+	offset := flag.String("offset", "0m", "Offset (Xm, Xh, or Xd) from now to start metric sample collection.")
+	interval := flag.String("interval", "30s", "Query interval (Xs")
 
 	flag.Parse()
 
 	return options{
-		server:       *server,
-		sampleMin:    intOption(*sampleMin),
-		samplePeriod: durationOption(*samplePeriod),
-		sampleOffset: durationOption(*sampleOffset),
-		interval:     durationOption(*interval),
+		server:     *server,
+		sampleSize: intOption(*sampleSize),
+		offset:     durationOption(*offset),
+		interval:   durationOption(*interval),
 	}
 }
 
@@ -100,12 +59,106 @@ func durationOption(option string) time.Duration {
 func validateOptions(options options) error {
 	fmt.Printf("Options: %+v\n", options)
 
-	if options.sampleMin <= 0 {
-		return errors.New("-sampleMin must be > 0")
+	if options.sampleSize <= 0 {
+		return errors.New("SampleSize must be > 0")
 	}
 	if options.server == "" {
-		return errors.New("-server must be set")
+		return errors.New("Server must be set")
 	}
 
 	return nil
+}
+
+type TSExpression string
+
+var (
+	tsExpressions = []TSExpression{
+		"http_requests_total",
+	}
+)
+
+func (ts TSExpression) process(o options, api v1.API) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := fmt.Sprintf("%v [%v]", ts, o.interval)
+	if o.offset.Minutes() > 0 {
+		s = fmt.Sprintf("%v offset %vm", s, o.offset.Minutes())
+	}
+	fmt.Println("Full TS Expression:", s)
+	value, err := api.Query(ctx, s, time.Now())
+	checkError(err)
+
+	switch t := value.Type(); t {
+	case model.ValVector: // Instant Vector
+		fmt.Printf("Handle Instant Vector\n")
+		vector := value.(model.Vector)
+		for _, sample := range vector {
+			fmt.Printf("sample: %v\n", sample)
+		}
+	case model.ValMatrix: // Range Vector
+		fmt.Printf("Handle Range Vector\n")
+		matrix := value.(model.Matrix)
+		for _, sample := range matrix {
+			evaluate(sample, o)
+		}
+	default:
+		fmt.Printf("I don't know about type %v!\n", t)
+	}
+}
+
+func checkError(err error) {
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+var nelsonMap = make(map[string]nelson.Data)
+
+type SamplePair model.SamplePair
+
+// Time() returns ms since epoch (i.e. unix timestamp)
+func (sp SamplePair) Time() int64 {
+	return int64(sp.Timestamp)
+}
+
+func (sp SamplePair) Val() float64 {
+	return float64(sp.Value)
+}
+
+func toSamplePairs(in []model.SamplePair) (out []nelson.Sample) {
+	out = make([]nelson.Sample, len(in))
+	for i, v := range in {
+		out[i] = SamplePair(v)
+	}
+	return out
+}
+
+func evaluate(s *model.SampleStream, o options) {
+	k := s.String()
+	d, ok := nelsonMap[k]
+	if !ok {
+		fmt.Println("Start tracking TS ", k)
+		d = nelson.NewData(s.Metric, o.sampleSize, nelson.CommonRules...)
+		nelsonMap[k] = d
+	}
+	var sps []nelson.Sample = toSamplePairs(s.Values)
+	d.AddSamples(sps)
+	fmt.Printf("Data: %+v\n", d)
+}
+
+func main() {
+	options := parseFlags()
+	checkError(validateOptions(options))
+
+	config := api.Config{options.server, nil}
+	client, err := api.NewClient(config)
+	checkError(err)
+
+	api := v1.NewAPI(client)
+
+	for _, ts := range tsExpressions {
+		ts.process(options, api)
+	}
 }

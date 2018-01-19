@@ -3,35 +3,77 @@ package nelson
 
 import (
 	"container/list"
+	"fmt"
 	"math"
 	"sort"
-	"time"
 
 	"github.com/gonum/stat"
 )
+
+type Rule struct {
+	Name        string
+	Description string
+	f           func(d *Data, v float64) bool
+}
+
+var Rule1 = Rule{
+	"Rule1",
+	"One point is more than 3 standard deviations from the mean.",
+	(*Data).rule1,
+}
+var Rule2 = Rule{
+	"Rule2",
+	"Nine (or more) points in a row are on the same side of the mean.",
+	(*Data).rule2,
+}
+var Rule3 = Rule{
+	"Rule3",
+	"Six (or more) points in a row are continually increasing (or decreasing).",
+	(*Data).rule3,
+}
+var Rule4 = Rule{
+	"Rule4",
+	"Fourteen (or more) points in a row alternate in direction, increasing then decreasing.",
+	(*Data).rule4,
+}
+var Rule5 = Rule{
+	"Rule5",
+	"At least 2 of 3 points in a row are > 2 standard deviations from the mean in the same direction.",
+	(*Data).rule5,
+}
+var Rule6 = Rule{
+	"Rule6",
+	"At least 4 of 5 points in a row are > 1 standard deviation from the mean in the same direction.",
+	(*Data).rule6,
+}
+var Rule7 = Rule{
+	"Rule7",
+	"Fifteen points in a row are all within 1 standard deviation of the mean on either side of the mean.",
+	(*Data).rule7,
+}
+var Rule8 = Rule{
+	"Rule8",
+	"Eight points in a row exist, but none within 1 standard deviation of the mean and the points are in both directions from the mean.",
+	(*Data).rule8,
+}
+
+func (r Rule) String() string {
+	return r.Name
+}
+
+// CommonRules includes all rules other than: Rule7
+var CommonRules = []Rule{Rule1, Rule2, Rule3, Rule4, Rule5, Rule6, Rule8}
+
+// AllRules is not recommended for metrics with little to no variance when well-behaved
+var AllRules = []Rule{Rule1, Rule2, Rule3, Rule4, Rule5, Rule6, Rule7, Rule8}
 
 // MaxSamples indicates the max number of Samples needed to evaluate any Rule.
 // Rule7 requires the most Samples, 15.
 const MaxSamples = 15
 
-type Rule string
-
-var Rule1 Rule = "One point is more than 3 standard deviations from the mean."
-var Rule2 Rule = "Nine (or more) points in a row are on the same side of the mean."
-var Rule3 Rule = "Six (or more) points in a row are continually increasing (or decreasing)."
-var Rule4 Rule = "Fourteen (or more) points in a row alternate in direction, increasing then decreasing."
-var Rule5 Rule = "At least 2 of 3 points in a row are > 2 standard deviations from the mean in the same direction."
-var Rule6 Rule = "At least 4 of 5 points in a row are > 1 standard deviation from the mean in the same direction."
-var Rule7 Rule = "Fifteen points in a row are all within 1 standard deviation of the mean on either side of the mean."
-var Rule8 Rule = "Eight points in a row exist, but none within 1 standard deviation of the mean and the points are in both directions from the mean."
-
-func (n Rule) Description() string {
-	return string(n)
-}
-
 type Sample interface {
-	Time() time.Time
-	Value() float64
+	Time() int64 // unix time in ms
+	Val() float64
 }
 
 type statistics struct {
@@ -66,7 +108,7 @@ func (s *statistics) clear() {
 // added after stats are ready are ignored.
 func (s *statistics) addSample(sample Sample) bool {
 	if !s.ready {
-		s.values[s.numSamples] = sample.Value()
+		s.values[s.numSamples] = sample.Val()
 		s.numSamples++
 		if s.numSamples == s.sampleSize {
 			s.standardDeviation = stat.StdDev(s.values, nil)
@@ -79,15 +121,17 @@ func (s *statistics) addSample(sample Sample) bool {
 	return s.ready
 }
 
-// NelsonData tracks nelson rule evaluations for a particular time series.  Each NelsonData
-// can be configured with its own sample size.s for different conditions. The life-cycle of
-// the NelsonData is tied to the TS.
+// Data tracks nelson rule evaluations for a particular time series.  Each Data
+// can be configured with its own sample size and rule set. The life-cycle of
+// Data should be tied to the TS.
 type Data struct {
-	stats statistics
-	// List of Rule Elements indicating currently violated Rules
+	Metric     interface{}
 	Violations *list.List
 	// List of Sample Elements backing the current Rule evaluations
-	ViolationsData         *list.List
+	ViolationsData *list.List
+	Rules          []Rule
+	stats          statistics
+	// List of Rule Elements indicating currently violated Rules
 	rule2Count             int
 	rule3Count             int
 	rule3PreviousSample    *float64
@@ -106,14 +150,23 @@ type Data struct {
 	rule8Count    int
 }
 
-func NewData(sampleSize int) Data {
+func NewData(m interface{}, sampleSize int, rules ...Rule) Data {
+	if nil == rules {
+		rules = AllRules
+	}
 	return Data{
-		stats:          newStatistics(sampleSize),
+		Metric:         m,
+		Rules:          rules,
 		Violations:     list.New(),
 		ViolationsData: list.New(),
 		rule5LastThree: list.New(),
 		rule6LastFive:  list.New(),
+		stats:          newStatistics(sampleSize),
 	}
+}
+
+func (d Data) String() string {
+	return fmt.Sprintf("Violations:%v, Data: %v, stats:%+v", d.Violations.Len(), d.ViolationsData.Len(), d.stats)
 }
 
 func (d *Data) Clear() {
@@ -140,11 +193,11 @@ func (d *Data) hasViolations() bool {
 	return 0 < d.Violations.Len()
 }
 
-func (d *Data) AddSamples(samples ...Sample) {
+func (d *Data) AddSamples(samples []Sample) {
 	// sort by time ascending (process oldest first)
 	sort.Slice(samples,
 		func(i, j int) bool {
-			return samples[i].Time().Before(samples[j].Time())
+			return samples[i].Time() < samples[j].Time()
 		})
 
 	for _, s := range samples {
@@ -162,29 +215,10 @@ func (d *Data) evaluate(s Sample) {
 		d.ViolationsData.Remove(d.ViolationsData.Back())
 	}
 
-	if d.rule1(s.Value()) {
-		d.Violations.PushBack(Rule1)
-	}
-	if d.rule2(s.Value()) {
-		d.Violations.PushBack(Rule2)
-	}
-	if d.rule3(s.Value()) {
-		d.Violations.PushBack(Rule3)
-	}
-	if d.rule4(s.Value()) {
-		d.Violations.PushBack(Rule4)
-	}
-	if d.rule5(s.Value()) {
-		d.Violations.PushBack(Rule5)
-	}
-	if d.rule6(s.Value()) {
-		d.Violations.PushBack(Rule6)
-	}
-	if d.rule7(s.Value()) {
-		d.Violations.PushBack(Rule7)
-	}
-	if d.rule8(s.Value()) {
-		d.Violations.PushBack(Rule8)
+	for _, r := range d.Rules {
+		if r.f(d, s.Val()) {
+			d.Violations.PushBack(r)
+		}
 	}
 }
 
