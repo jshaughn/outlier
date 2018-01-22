@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/api"
@@ -32,7 +33,7 @@ func parseFlags() options {
 	server := flag.String("server", serverDefault, "Prometheus server URL (can be set via PROMETHEUS_SERVER environment variable)")
 	sampleSize := flag.String("sampleSize", "50", "Number of data points used to calculate mean, standard deviation, etc.")
 	offset := flag.String("offset", "0m", "Offset (Xm, Xh, or Xd) from now to start metric sample collection.")
-	interval := flag.String("interval", "30s", "Query interval (Xs")
+	interval := flag.String("interval", "30s", "Query interval (Xs). Recommended 2 times the scrape interval.")
 
 	flag.Parse()
 
@@ -77,16 +78,34 @@ var (
 	}
 )
 
-func (ts TSExpression) process(o options, api v1.API) {
+// process() is expected to execute as a goroutine
+func (ts TSExpression) process(o options, api v1.API, wg sync.WaitGroup) {
+	wg.Add(1)
+	defer wg.Done()
+
+	queryTime := time.Now()
+	if o.offset.Seconds() > 0 {
+		queryTime = queryTime.Add(-o.offset)
+	}
+
+	query := fmt.Sprintf("%v [%v]", ts, o.interval)
+
+	for {
+		ts.query(query, queryTime, api, o)
+		time.Sleep(o.interval)
+		queryTime.Add(o.interval)
+	}
+}
+
+const TF = "2006-01-02 15:04:05"
+
+func (ts TSExpression) query(query string, queryTime time.Time, api v1.API, o options) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s := fmt.Sprintf("%v [%v]", ts, o.interval)
-	if o.offset.Minutes() > 0 {
-		s = fmt.Sprintf("%v offset %vm", s, o.offset.Minutes())
-	}
-	fmt.Println("Full TS Expression:", s)
-	value, err := api.Query(ctx, s, time.Now())
+	fmt.Printf("Executing query %s@%s (now=%v)\n", query, queryTime.Format(TF), time.Now().Format(TF))
+
+	value, err := api.Query(ctx, query, queryTime)
 	checkError(err)
 
 	switch t := value.Type(); t {
@@ -114,7 +133,8 @@ func checkError(err error) {
 	}
 }
 
-var nelsonMap = make(map[string]nelson.Data)
+// nelsonMap is concurrent key=metric string, value=*nelson.Data
+var nelsonMap sync.Map
 
 type SamplePair model.SamplePair
 
@@ -137,11 +157,15 @@ func toSamplePairs(in []model.SamplePair) (out []nelson.Sample) {
 
 func evaluate(s *model.SampleStream, o options) {
 	k := s.String()
-	d, ok := nelsonMap[k]
+	result, ok := nelsonMap.Load(k)
+	var d *nelson.Data
 	if !ok {
 		fmt.Println("Start tracking TS ", k)
-		d = nelson.NewData(s.Metric, o.sampleSize, nelson.CommonRules...)
-		nelsonMap[k] = d
+		ds := nelson.NewData(s.Metric, o.sampleSize, nelson.CommonRules...)
+		d = &ds
+		nelsonMap.Store(k, d)
+	} else {
+		d = result.(*nelson.Data)
 	}
 	var sps []nelson.Sample = toSamplePairs(s.Values)
 	d.AddSamples(sps)
@@ -158,7 +182,11 @@ func main() {
 
 	api := v1.NewAPI(client)
 
+	var wg sync.WaitGroup
+
 	for _, ts := range tsExpressions {
-		ts.process(options, api)
+		ts.process(options, api, wg)
 	}
+
+	wg.Wait()
 }

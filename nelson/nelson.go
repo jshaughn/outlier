@@ -126,7 +126,7 @@ func (s *statistics) addSample(sample Sample) bool {
 // Data should be tied to the TS.
 type Data struct {
 	Metric     interface{}
-	Violations *list.List
+	Violations map[string]int
 	// List of Sample Elements backing the current Rule evaluations
 	ViolationsData *list.List
 	Rules          []Rule
@@ -154,10 +154,11 @@ func NewData(m interface{}, sampleSize int, rules ...Rule) Data {
 	if nil == rules {
 		rules = AllRules
 	}
+
 	return Data{
 		Metric:         m,
 		Rules:          rules,
-		Violations:     list.New(),
+		Violations:     make(map[string]int),
 		ViolationsData: list.New(),
 		rule5LastThree: list.New(),
 		rule6LastFive:  list.New(),
@@ -166,12 +167,21 @@ func NewData(m interface{}, sampleSize int, rules ...Rule) Data {
 }
 
 func (d Data) String() string {
-	return fmt.Sprintf("Violations:%v, Data: %v, stats:%+v", d.Violations.Len(), d.ViolationsData.Len(), d.stats)
+	if len(d.Violations) == 0 {
+		return fmt.Sprintf("No Violations, stats:%+v", d.stats)
+	}
+
+	var vs, comma string
+	for k, v := range d.Violations {
+		vs += fmt.Sprintf("%s%s(%v)", comma, k, v)
+		comma = ","
+	}
+	return fmt.Sprintf("Violations %v Samples(%v), stats:%+v", vs, d.ViolationsData.Len(), d.stats)
 }
 
 func (d *Data) Clear() {
 	d.stats.clear()
-	d.Violations = d.Violations.Init()
+	d.Violations = make(map[string]int)
 	d.ViolationsData = d.ViolationsData.Init()
 	d.rule2Count = 0
 	d.rule3Count = 0
@@ -190,7 +200,7 @@ func (d *Data) Clear() {
 }
 
 func (d *Data) hasViolations() bool {
-	return 0 < d.Violations.Len()
+	return len(d.Violations) > 0
 }
 
 func (d *Data) AddSamples(samples []Sample) {
@@ -217,30 +227,37 @@ func (d *Data) evaluate(s Sample) {
 
 	for _, r := range d.Rules {
 		if r.f(d, s.Val()) {
-			d.Violations.PushBack(r)
+			d.Violations[r.Name] += 1
 		}
 	}
 }
 
 // one point is more than 3 standard deviations from the mean
 func (d *Data) rule1(s float64) bool {
+	if d.stats.standardDeviation == 0.0 {
+		return false
+	}
+
 	return math.Abs(s-d.stats.mean) > d.stats.threeDeviations
 }
 
 // Nine (or more) points in a row are on the same side of the mean
 func (d *Data) rule2(s float64) bool {
-	if s > d.stats.mean {
+	switch {
+	case s > d.stats.mean:
 		if d.rule2Count > 0 {
 			d.rule2Count++
 		} else {
 			d.rule2Count = 1
 		}
-	} else {
+	case s < d.stats.mean:
 		if d.rule2Count < 0 {
 			d.rule2Count--
 		} else {
 			d.rule2Count = -1
 		}
+	default:
+		d.rule2Count = 0
 	}
 
 	return math.Abs(float64(d.rule2Count)) >= 9
@@ -304,6 +321,9 @@ func (d *Data) rule4(s float64) bool {
 
 // At least 2 of 3 points in a row are > 2 standard deviations from the mean in the same direction
 func (d *Data) rule5(s float64) bool {
+	if d.stats.standardDeviation == 0.0 {
+		return false
+	}
 
 	if d.rule5LastThree.Len() == 3 {
 		switch d.rule5LastThree.Remove(d.rule5LastThree.Back()) {
@@ -330,6 +350,9 @@ func (d *Data) rule5(s float64) bool {
 
 // At least 4 of 5 points in a row are > 1 standard deviation from the mean in the same direction
 func (d *Data) rule6(s float64) bool {
+	if d.stats.standardDeviation == 0.0 {
+		return false
+	}
 
 	if d.rule6LastFive.Len() == 5 {
 		switch d.rule6LastFive.Remove(d.rule6LastFive.Back()) {
@@ -359,6 +382,9 @@ func (d *Data) rule6(s float64) bool {
 // Note: I have my doubts about this one wrt monitored metrics, i think it may not be uncommon to have
 // a very steady metric. Minimally, I have taken away the flat-line case where all samples are the mean.
 func (d *Data) rule7(s float64) bool {
+	if d.stats.standardDeviation == 0.0 {
+		return false
+	}
 
 	if s == d.stats.mean {
 		d.rule7Count = 0
@@ -377,6 +403,9 @@ func (d *Data) rule7(s float64) bool {
 // Eight points in a row exist, but none within 1 standard deviation of the mean
 // and the points are in both directions from the mean
 func (d *Data) rule8(s float64) bool {
+	if d.stats.standardDeviation == 0.0 {
+		return false
+	}
 
 	if math.Abs(s-d.stats.mean) > d.stats.standardDeviation {
 		d.rule8Count++
