@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/common/model"
 
 	"github.com/jshaughn/outlier/nelson"
+	"github.com/jshaughn/outlier/scrape"
 )
 
 type options struct {
@@ -23,6 +24,7 @@ type options struct {
 	sampleSize int
 	offset     time.Duration
 	interval   time.Duration
+	endpoint   string
 }
 
 func parseFlags() options {
@@ -34,6 +36,7 @@ func parseFlags() options {
 	sampleSize := flag.String("sampleSize", "50", "Number of data points used to calculate mean, standard deviation, etc.")
 	offset := flag.String("offset", "0m", "Offset (Xm, Xh, or Xd) from now to start metric sample collection.")
 	interval := flag.String("interval", "30s", "Query interval (Xs). Recommended 2 times the scrape interval.")
+	endpoint := flag.String("endpoint", ":8080", "The scrape endpoint")
 
 	flag.Parse()
 
@@ -42,6 +45,7 @@ func parseFlags() options {
 		sampleSize: intOption(*sampleSize),
 		offset:     durationOption(*offset),
 		interval:   durationOption(*interval),
+		endpoint:   *endpoint,
 	}
 }
 
@@ -74,7 +78,7 @@ type TSExpression string
 
 var (
 	tsExpressions = []TSExpression{
-		"http_requests_total",
+		"response_time",
 	}
 )
 
@@ -93,17 +97,18 @@ func (ts TSExpression) process(o options, api v1.API, wg sync.WaitGroup) {
 	for {
 		ts.query(query, queryTime, api, o)
 		time.Sleep(o.interval)
-		queryTime.Add(o.interval)
+		queryTime = queryTime.Add(o.interval)
 	}
 }
 
+// TF is the TimeFormat for printing timestamp
 const TF = "2006-01-02 15:04:05"
 
 func (ts TSExpression) query(query string, queryTime time.Time, api v1.API, o options) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fmt.Printf("Executing query %s@%s (now=%v)\n", query, queryTime.Format(TF), time.Now().Format(TF))
+	fmt.Printf("Executing query %s @%s (now=%v)\n", query, queryTime.Format(TF), time.Now().Format(TF))
 
 	value, err := api.Query(ctx, query, queryTime)
 	checkError(err)
@@ -116,13 +121,13 @@ func (ts TSExpression) query(query string, queryTime time.Time, api v1.API, o op
 			fmt.Printf("sample: %v\n", sample)
 		}
 	case model.ValMatrix: // Range Vector
-		fmt.Printf("Handle Range Vector\n")
 		matrix := value.(model.Matrix)
+		//fmt.Printf("Handle Range Vector, matrix len=%v\n", len(matrix))
 		for _, sample := range matrix {
 			evaluate(sample, o)
 		}
 	default:
-		fmt.Printf("I don't know about type %v!\n", t)
+		fmt.Printf("No handling for type %v!\n", t)
 	}
 }
 
@@ -156,7 +161,13 @@ func toSamplePairs(in []model.SamplePair) (out []nelson.Sample) {
 }
 
 func evaluate(s *model.SampleStream, o options) {
-	k := s.String()
+	//nelsonMap.Range(
+	//	func(k interface{}, v interface{}) bool {
+	//		fmt.Println("MapKey:", k)
+	//		return true
+	//	})
+
+	k := s.Metric.String()
 	result, ok := nelsonMap.Load(k)
 	var d *nelson.Data
 	if !ok {
@@ -175,6 +186,9 @@ func evaluate(s *model.SampleStream, o options) {
 func main() {
 	options := parseFlags()
 	checkError(validateOptions(options))
+
+	ep := scrape.Scrape{options.endpoint}
+	go ep.Start()
 
 	config := api.Config{options.server, nil}
 	client, err := api.NewClient(config)

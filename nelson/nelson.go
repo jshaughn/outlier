@@ -88,6 +88,14 @@ type statistics struct {
 	threeDeviations   float64
 }
 
+func (s statistics) String() string {
+	if !s.ready {
+		return fmt.Sprintf("Waiting on [%v] samples", s.sampleSize-s.numSamples)
+	}
+	return fmt.Sprintf("mean=%.2f, stddev=%.2f, twodev=%.2f, threedev=%.2f",
+		s.mean, s.standardDeviation, s.twoDeviations, s.threeDeviations)
+}
+
 func newStatistics(sampleSize int) statistics {
 	return statistics{
 		sampleSize: sampleSize,
@@ -111,10 +119,10 @@ func (s *statistics) addSample(sample Sample) bool {
 		s.values[s.numSamples] = sample.Val()
 		s.numSamples++
 		if s.numSamples == s.sampleSize {
+			s.mean = stat.Mean(s.values, nil)
 			s.standardDeviation = stat.StdDev(s.values, nil)
 			s.twoDeviations = 2 * s.standardDeviation
 			s.threeDeviations = 3 * s.standardDeviation
-			s.mean = stat.Mean(s.values, nil)
 			s.ready = true
 		}
 	}
@@ -140,12 +148,8 @@ type Data struct {
 	rule4PreviousDirection string
 	// List of Sample.Value() Elements
 	rule5LastThree *list.List
-	rule5Above     int
-	rule5Below     int
 	// List of Sample.Value() Elements
 	rule6LastFive *list.List
-	rule6Above    int
-	rule6Below    int
 	rule7Count    int
 	rule8Count    int
 }
@@ -168,15 +172,23 @@ func NewData(m interface{}, sampleSize int, rules ...Rule) Data {
 
 func (d Data) String() string {
 	if len(d.Violations) == 0 {
-		return fmt.Sprintf("No Violations, stats:%+v", d.stats)
+		return fmt.Sprintf("%v:\n\tNo Violations, stats:%+v", d.Metric, d.stats)
 	}
 
-	var vs, comma string
+	var vr, comma string
 	for k, v := range d.Violations {
-		vs += fmt.Sprintf("%s%s(%v)", comma, k, v)
+		vr += fmt.Sprintf("%s%s(%v)", comma, k, v)
 		comma = ","
 	}
-	return fmt.Sprintf("Violations %v Samples(%v), stats:%+v", vs, d.ViolationsData.Len(), d.stats)
+	vd := "["
+	comma = ""
+	for e := d.ViolationsData.Front(); e != nil; e = e.Next() {
+		vd += fmt.Sprintf("%s%.2f", comma, e.Value.(Sample).Val())
+		comma = ","
+	}
+	vd += "]"
+
+	return fmt.Sprintf("%v:\n\tviolations: %v\n\tstats: %v\n\tvalues: %v", d.Metric, vr, d.stats, vd)
 }
 
 func (d *Data) Clear() {
@@ -190,11 +202,7 @@ func (d *Data) Clear() {
 	d.rule4PreviousSample = nil
 	d.rule4PreviousDirection = ""
 	d.rule5LastThree.Init()
-	d.rule5Above = 0
-	d.rule5Below = 0
 	d.rule6LastFive.Init()
-	d.rule6Above = 0
-	d.rule6Below = 0
 	d.rule7Count = 0
 	d.rule8Count = 0
 }
@@ -325,27 +333,31 @@ func (d *Data) rule5(s float64) bool {
 		return false
 	}
 
-	if d.rule5LastThree.Len() == 3 {
-		switch d.rule5LastThree.Remove(d.rule5LastThree.Back()) {
-		case ">":
-			d.rule5Above--
-		case "<":
-			d.rule5Below--
-		}
-	}
 	if math.Abs(s-d.stats.mean) > d.stats.twoDeviations {
 		if s > d.stats.mean {
-			d.rule5Above++
 			d.rule5LastThree.PushFront(">")
 		} else {
-			d.rule5Below++
 			d.rule5LastThree.PushFront("<")
 		}
 	} else {
 		d.rule5LastThree.PushFront("")
 	}
 
-	return d.rule5Above >= 2 || d.rule5Below >= 2
+	if d.rule5LastThree.Len() > 3 {
+		d.rule5LastThree.Remove(d.rule5LastThree.Back())
+	}
+
+	var above, below int
+	for e := d.rule5LastThree.Front(); e != nil; e = e.Next() {
+		switch e.Value.(string) {
+		case ">":
+			above++
+		case "<":
+			below++
+		}
+	}
+
+	return above >= 2 || below >= 2
 }
 
 // At least 4 of 5 points in a row are > 1 standard deviation from the mean in the same direction
@@ -354,28 +366,31 @@ func (d *Data) rule6(s float64) bool {
 		return false
 	}
 
-	if d.rule6LastFive.Len() == 5 {
-		switch d.rule6LastFive.Remove(d.rule6LastFive.Back()) {
-		case ">":
-			d.rule6Above--
-		case "<":
-			d.rule6Below--
-		}
-	}
-
 	if math.Abs(s-d.stats.mean) > d.stats.standardDeviation {
 		if s > d.stats.mean {
-			d.rule6Above++
 			d.rule6LastFive.PushFront(">")
 		} else {
-			d.rule6Below++
 			d.rule6LastFive.PushFront("<")
 		}
 	} else {
 		d.rule6LastFive.PushFront("")
 	}
 
-	return d.rule6Above >= 4 || d.rule6Below >= 4
+	if d.rule6LastFive.Len() > 5 {
+		d.rule6LastFive.Remove(d.rule6LastFive.Back())
+	}
+
+	var above, below int
+	for e := d.rule6LastFive.Front(); e != nil; e = e.Next() {
+		switch e.Value.(string) {
+		case ">":
+			above++
+		case "<":
+			below++
+		}
+	}
+
+	return above >= 4 || below >= 4
 }
 
 // Fifteen points in a row are all within 1 standard deviation of the mean on either side of the mean
