@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -83,8 +84,7 @@ var (
 )
 
 // process() is expected to execute as a goroutine
-func (ts TSExpression) process(o options, api v1.API, wg sync.WaitGroup) {
-	wg.Add(1)
+func (ts TSExpression) process(o options, wg sync.WaitGroup, api v1.API, ep scrape.Scrape) {
 	defer wg.Done()
 
 	queryTime := time.Now()
@@ -95,7 +95,7 @@ func (ts TSExpression) process(o options, api v1.API, wg sync.WaitGroup) {
 	query := fmt.Sprintf("%v [%v]", ts, o.interval)
 
 	for {
-		ts.query(query, queryTime, api, o)
+		ts.query(query, queryTime, o, api, ep)
 		time.Sleep(o.interval)
 		queryTime = queryTime.Add(o.interval)
 	}
@@ -104,7 +104,7 @@ func (ts TSExpression) process(o options, api v1.API, wg sync.WaitGroup) {
 // TF is the TimeFormat for printing timestamp
 const TF = "2006-01-02 15:04:05"
 
-func (ts TSExpression) query(query string, queryTime time.Time, api v1.API, o options) {
+func (ts TSExpression) query(query string, queryTime time.Time, o options, api v1.API, ep scrape.Scrape) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -123,8 +123,8 @@ func (ts TSExpression) query(query string, queryTime time.Time, api v1.API, o op
 	case model.ValMatrix: // Range Vector
 		matrix := value.(model.Matrix)
 		//fmt.Printf("Handle Range Vector, matrix len=%v\n", len(matrix))
-		for _, sample := range matrix {
-			evaluate(sample, o)
+		for _, s := range matrix {
+			processSampleStream(s, o, ep)
 		}
 	default:
 		fmt.Printf("No handling for type %v!\n", t)
@@ -152,15 +152,24 @@ func (sp SamplePair) Val() float64 {
 	return float64(sp.Value)
 }
 
-func toSamplePairs(in []model.SamplePair) (out []nelson.Sample) {
+func toSamplePairs(in []model.SamplePair, sorted bool) (out []nelson.Sample) {
 	out = make([]nelson.Sample, len(in))
 	for i, v := range in {
 		out[i] = SamplePair(v)
 	}
+
+	// sort by time ascending (process oldest first)
+	if sorted {
+		sort.Slice(out,
+			func(i, j int) bool {
+				return out[i].Time() < out[j].Time()
+			})
+	}
+
 	return out
 }
 
-func evaluate(s *model.SampleStream, o options) {
+func processSampleStream(s *model.SampleStream, o options, ep scrape.Scrape) {
 	//nelsonMap.Range(
 	//	func(k interface{}, v interface{}) bool {
 	//		fmt.Println("MapKey:", k)
@@ -178,8 +187,17 @@ func evaluate(s *model.SampleStream, o options) {
 	} else {
 		d = result.(*nelson.Data)
 	}
-	var sps []nelson.Sample = toSamplePairs(s.Values)
-	d.AddSamples(sps)
+
+	for _, sp := range toSamplePairs(s.Values, true) {
+		violations := d.AddSample(sp)
+		for k, v := range violations {
+			if v {
+				fmt.Printf("Add Violation! %s %v\n", k, s.Metric)
+				ep.Add(k, s.Metric.String(), 1)
+			}
+
+		}
+	}
 	fmt.Printf("Data: %+v\n", d)
 }
 
@@ -199,7 +217,8 @@ func main() {
 	var wg sync.WaitGroup
 
 	for _, ts := range tsExpressions {
-		ts.process(options, api, wg)
+		wg.Add(1)
+		go ts.process(options, wg, api, ep)
 	}
 
 	wg.Wait()

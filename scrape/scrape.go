@@ -15,17 +15,29 @@ type Scrape struct {
 }
 
 var (
+	nelsonRules = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "nelson_rule",
+			Help: "Nelson Rule Violation.",
+		},
+		[]string{"rule", "ts"},
+	)
 	responseTimes = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "response_time",
-			Help: "Response times for testing.",
+			Help: "Response times (for testing only).",
 		},
 		[]string{"variance"},
 	)
 )
 
+func (s *Scrape) Add(rule, query string, val float64) {
+	nelsonRules.WithLabelValues(rule, query).Add(val)
+}
+
 func (s *Scrape) Start() {
-	// Register the summary and the histogram with Prometheus's default registry.
+	// Register the reported metrics
+	prometheus.MustRegister(nelsonRules)
 	prometheus.MustRegister(responseTimes)
 
 	// generate values every 5s, start stable and then add variance...

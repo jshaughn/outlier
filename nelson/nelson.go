@@ -5,7 +5,6 @@ import (
 	"container/list"
 	"fmt"
 	"math"
-	"sort"
 
 	"github.com/gonum/stat"
 )
@@ -211,33 +210,31 @@ func (d *Data) hasViolations() bool {
 	return len(d.Violations) > 0
 }
 
-func (d *Data) AddSamples(samples []Sample) {
-	// sort by time ascending (process oldest first)
-	sort.Slice(samples,
-		func(i, j int) bool {
-			return samples[i].Time() < samples[j].Time()
-		})
-
-	for _, s := range samples {
-		if d.stats.ready {
-			d.evaluate(s)
-		} else {
-			d.stats.addSample(s)
-		}
+func (d *Data) AddSample(s Sample) map[string]bool {
+	if d.stats.ready {
+		return d.evaluate(s)
 	}
+	d.stats.addSample(s)
+	return nil
 }
 
-func (d *Data) evaluate(s Sample) {
+func (d *Data) evaluate(s Sample) (result map[string]bool) {
 	d.ViolationsData.PushFront(s)
 	if d.ViolationsData.Len() > MaxSamples {
 		d.ViolationsData.Remove(d.ViolationsData.Back())
 	}
 
+	result = make(map[string]bool)
 	for _, r := range d.Rules {
-		if r.f(d, s.Val()) {
+		violation := r.f(d, s.Val())
+		result[r.Name] = violation
+		if violation {
+			fmt.Printf("Violation! %s %v\n", r.Name, d.Metric)
 			d.Violations[r.Name] += 1
 		}
 	}
+
+	return result
 }
 
 // one point is more than 3 standard deviations from the mean
